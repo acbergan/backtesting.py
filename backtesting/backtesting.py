@@ -422,7 +422,8 @@ class Order:
                  sl_price: Optional[float] = None,
                  tp_price: Optional[float] = None,
                  parent_trade: Optional['Trade'] = None,
-                 tag: object = None):
+                 tag: object = None,
+                 time_index: Optional[int] = None):
         self.__broker = broker
         assert size != 0
         self.__size = size
@@ -432,10 +433,13 @@ class Order:
         self.__tp_price = tp_price
         self.__parent_trade = parent_trade
         self.__tag = tag
+        self.__time_index = time_index
+        self.__replaced = ""
 
     def _replace(self, **kwargs):
         for k, v in kwargs.items():
             setattr(self, f'_{self.__class__.__qualname__}__{k}', v)
+            self.__replaced += f'{k}={v}, '
         return self
 
     def __repr__(self):
@@ -448,11 +452,15 @@ class Order:
                                                  ('tp', self.__tp_price),
                                                  ('contingent', self.is_contingent),
                                                  ('tag', self.__tag),
+                                                 ('time_index', self.__time_index),
                                              ) if value is not None))  # noqa: E126
 
     def cancel(self):
         """Cancel the order."""
+        if self.__broker.verbose:
+            print(f"{self.__broker._data.index[-1]} Canceling order: {self}")
         self.__broker.orders.remove(self)
+        self.__broker.orderscanceled.append(self.to_dict())
         trade = self.__parent_trade
         if trade:
             if self is trade._sl_order:
@@ -461,6 +469,17 @@ class Order:
                 trade._replace(tp_order=None)
             else:
                 pass  # Order placed by Trade.close()
+
+    def to_dict(self):
+        return {'size': self.__size,
+                'limit': self.__limit_price,
+                'stop': self.__stop_price,
+                'sl': self.__sl_price,
+                'tp': self.__tp_price,
+                'contingent': self.is_contingent,
+                'tag': self.__tag,
+                'time_index': self.__time_index,
+                'replaced': self.__replaced,}
 
     # Fields getters
 
@@ -528,6 +547,13 @@ class Order:
 
     __pdoc__['Order.parent_trade'] = False
 
+    @property
+    def time_index(self):
+        """
+        Time when order was placed
+        """
+        return self.__time_index
+
     # Extra properties
 
     @property
@@ -593,6 +619,7 @@ class Trade:
         size = copysign(max(1, round(abs(self.__size) * portion)), -self.__size)
         order = Order(self.__broker, size, parent_trade=self, tag=self.__tag)
         self.__broker.orders.insert(0, order)
+        self.__broker.orderhist.append(order.to_dict())
 
     # Fields getters
 
@@ -765,6 +792,11 @@ class _Broker:
         self.position = Position(self)
         self.closed_trades: List[Trade] = []
 
+        self.orderhist: List[Order] = []
+        self.orderscanceled: List[Order] = []
+        self.ambiguous_orders: List[Order] = []
+        self.verbose = False
+
     def _commission_func(self, order_size, price):
         return self._commission_fixed + abs(order_size) * price * self._commission_relative
 
@@ -804,7 +836,9 @@ class _Broker:
                     "Short orders require: "
                     f"TP ({tp}) < LIMIT ({limit or stop or adjusted_price}) < SL ({sl})")
 
-        order = Order(self, size, limit, stop, sl, tp, trade, tag)
+        order = Order(self, size, limit, stop, sl, tp, trade, tag, self._i)
+        if self.verbose:
+            print(f"{self._data.index[-1]} New order: {order}")
 
         if not trade:
             # If exclusive orders (each new order auto-closes previous orders/position),
@@ -818,6 +852,7 @@ class _Broker:
 
         # Put the new order in the order queue, Ensure SL orders are processed first
         self.orders.insert(0 if trade and stop else len(self.orders), order)
+        self.orderhist.append(order.to_dict())
 
         return order
 
@@ -845,6 +880,7 @@ class _Broker:
 
     def next(self):
         i = self._i = len(self._data) - 1
+        self.time = self._data.index[-1]
         self._process_orders()
 
         # Log account equity for the equity curve
@@ -855,6 +891,8 @@ class _Broker:
         if equity <= 0:
             assert self.margin_available <= 0
             for trade in self.trades:
+                if self.verbose:
+                    print(f'{self._i} Closing trade due to insufficient funds 1:', trade)
                 self._close_trade(trade, self._data.Close[-1], i)
             self._cash = 0
             self._equity[i:] = 0
@@ -882,6 +920,8 @@ class _Broker:
                 # > When the stop price is reached, a stop order becomes a market/limit order.
                 # https://www.sec.gov/fast-answers/answersstopordhtm.html
                 order._replace(stop_price=None)
+                if self.verbose:
+                    print(f'{self.time} Stop hit. Replaced stop order with market order:', order)
 
             # Determine purchase price.
             # Check if limit order can be filled.
@@ -933,6 +973,8 @@ class _Broker:
                 else:
                     # It's a trade.close() order, now done
                     assert abs(_prev_size) >= abs(size) >= 1
+                    if self.verbose:
+                        print(f'{self.time} Removing order 4:', order)
                     self.orders.remove(order)
                 continue
 
@@ -955,6 +997,8 @@ class _Broker:
                         f'time={self._i}: Broker canceled the relative-sized '
                         f'order due to insufficient margin.', category=UserWarning)
                     # XXX: The order is canceled by the broker?
+                    if self.verbose:
+                        print(f'{self.time} Removing order 5:', order)
                     self.orders.remove(order)
                     continue
             assert size == round(size)
@@ -972,11 +1016,15 @@ class _Broker:
                     # Order size greater than this opposite-directed existing trade,
                     # so it will be closed completely
                     if abs(need_size) >= abs(trade.size):
+                        if self.verbose:
+                            print(f'{self.time} Closing trade 6:', trade)
                         self._close_trade(trade, price, time_index)
                         need_size += trade.size
                     else:
                         # The existing trade is larger than the new order,
                         # so it will only be closed partially
+                        if self.verbose:
+                            print(f'{self.time} Reducing trade 7:', trade)
                         self._reduce_trade(trade, price, need_size, time_index)
                         need_size = 0
 
@@ -986,11 +1034,15 @@ class _Broker:
             # If we don't have enough liquidity to cover for the order, the broker CANCELS it
             if abs(need_size) * adjusted_price_plus_commission > \
                     self.margin_available * self._leverage:
+                if self.verbose:
+                    print(f'{self.time} Removing order 8:', order)
                 self.orders.remove(order)
                 continue
 
             # Open a new trade
             if need_size:
+                if self.verbose:
+                    print(f'{self.time} Filling order {order}, {need_size} at ${adjusted_price}, calling _open_trade()')
                 self._open_trade(adjusted_price,
                                  need_size,
                                  order.sl,
@@ -1012,17 +1064,20 @@ class _Broker:
                         reprocess_orders = True
                     elif (low <= (order.sl or -np.inf) <= high or
                           low <= (order.tp or -np.inf) <= high):
-                        warnings.warn(
-                            f"({data.index[-1]}) A contingent SL/TP order would execute in the "
-                            "same bar its parent stop/limit order was turned into a trade. "
-                            "Since we can't assert the precise intra-candle "
-                            "price movement, the affected SL/TP order will instead be executed on "
-                            "the next (matching) price/bar, making the result (of this trade) "
-                            "somewhat dubious. "
-                            "See https://github.com/kernc/backtesting.py/issues/119",
-                            UserWarning)
+                        self.ambiguous_orders.append(order)
+                        # warnings.warn(
+                        #     f"({data.index[-1]}) A contingent SL/TP order would execute in the "
+                        #     "same bar its parent stop/limit order was turned into a trade. "
+                        #     "Since we can't assert the precise intra-candle "
+                        #     "price movement, the affected SL/TP order will instead be executed on "
+                        #     "the next (matching) price/bar, making the result (of this trade) "
+                        #     "somewhat dubious. "
+                        #     "See https://github.com/kernc/backtesting.py/issues/119",
+                        #     UserWarning)
 
             # Order processed
+            if self.verbose:
+                print(f'{self.time} Order filled:', order)
             self.orders.remove(order)
 
         if reprocess_orders:
@@ -1038,6 +1093,8 @@ class _Broker:
             close_trade = trade
         else:
             # Reduce existing trade ...
+            if self.verbose:
+                print(f'{self.time} Reducing trade TODO log better:', trade)
             trade._replace(size=size_left)
             if trade._sl_order:
                 trade._sl_order._replace(size=-trade.size)
@@ -1067,18 +1124,26 @@ class _Broker:
         # applied here instead of on Trade open because size could have changed
         # by way of _reduce_trade()
         closed_trade._commissions = commission + trade_open_commission
+        if self.verbose:
+            print(f'{self.time} Closed trade:', trade)
 
     def _open_trade(self, price: float, size: int,
                     sl: Optional[float], tp: Optional[float], time_index: int, tag):
         trade = Trade(self, size, price, time_index, tag)
         self.trades.append(trade)
+        if self.verbose:
+            print(f'{self.time} Opened trade:', trade)
         # Apply broker commission at trade open
         self._cash -= self._commission(size, price)
         # Create SL/TP (bracket) orders.
         if tp:
             trade.tp = tp
+            if self.verbose:
+                print(f'{self.time} Created tp order:', tp)
         if sl:
             trade.sl = sl
+            if self.verbose:
+                print(f'{self.time} Created sl order:', sl)
 
 
 class Backtest:
@@ -1240,7 +1305,7 @@ class Backtest:
         self._results: Optional[pd.Series] = None
         self._finalize_trades = bool(finalize_trades)
 
-    def run(self, **kwargs) -> pd.Series:
+    def run(self, verbose=False, **kwargs) -> pd.Series:
         """
         Run the backtest. Returns `pd.Series` with results and statistics.
 
@@ -1293,6 +1358,7 @@ class Backtest:
         data = _Data(self._data.copy(deep=False))
         broker: _Broker = self._broker(data=data)
         strategy: Strategy = self._strategy(broker, data, kwargs)
+        broker.verbose = verbose
 
         strategy.init()
         data._update()  # Strategy.init might have changed/added to data.df
@@ -1308,8 +1374,9 @@ class Backtest:
         # np.nan >= 3 is not invalid; it's False.
         with np.errstate(invalid='ignore'):
 
-            for i in _tqdm(range(start, len(self._data)), desc=self.run.__qualname__,
-                           unit='bar', mininterval=2, miniters=100):
+            iterator = range(start, len(self._data)) if verbose else \
+                _tqdm(range(start, len(self._data)), desc=self.run.__qualname__, unit='bar', mininterval=2, miniters=100)
+            for i in iterator:
                 # Prepare data and indicators for `next` call
                 data._set_length(i + 1)
                 for attr, indicator in indicator_attrs:
@@ -1338,6 +1405,7 @@ class Backtest:
             # Set data back to full length
             # for future `indicator._opts['data'].index` calls to work
             data._set_length(len(self._data))
+            self._data = data._Data__df
 
             equity = pd.Series(broker._equity).bfill().fillna(broker._cash).values
             self._results = compute_stats(
@@ -1346,8 +1414,14 @@ class Backtest:
                 ohlc_data=self._data,
                 risk_free_rate=0.0,
                 strategy_instance=strategy,
+                n_ambiguous=len(broker.ambiguous_orders),
             )
 
+        self.orderhist = pd.DataFrame(broker.orderhist)
+        self._results['_orderhist'] = self.orderhist
+        self.ambiguous_orders = broker.ambiguous_orders
+        self.trades = self._results['_trades']
+        self.closed_trades = strategy.closed_trades
         return self._results
 
     def optimize(self, *,
@@ -1358,7 +1432,9 @@ class Backtest:
                  return_heatmap: bool = False,
                  return_optimization: bool = False,
                  random_state: Optional[int] = None,
+                 return_all_stats: bool = False,
                  **kwargs) -> Union[pd.Series,
+                                    pd.DataFrame,
                                     Tuple[pd.Series, pd.Series],
                                     Tuple[pd.Series, pd.Series, dict]]:
         """
@@ -1501,6 +1577,7 @@ class Backtest:
                                     [p.values() for p in param_combos],
                                     names=next(iter(param_combos)).keys()))
 
+            all_stats = {}
             from . import Pool
             with Pool() as pool, \
                     SharedMemoryManager() as smm:
@@ -1516,6 +1593,7 @@ class Backtest:
                 for param_batch, result in zip(_batch(param_combos), results):
                     for params, stats in zip(param_batch, result):
                         if stats is not None:
+                            all_stats[tuple(params.values())] = stats
                             heatmap[tuple(params.values())] = maximize(stats)
 
             if pd.isnull(heatmap).all():
@@ -1526,6 +1604,11 @@ class Backtest:
                 best_params = heatmap.idxmax(skipna=True)
                 stats = self.run(**dict(zip(heatmap.index.names, best_params)))
 
+            if return_all_stats:
+                df = pd.DataFrame(all_stats).T
+                df.index.set_names(list(params.keys()), inplace=True)
+                df.drop(columns=['Start', 'End', 'Duration'], inplace=True)
+                stats = df
             if return_heatmap:
                 return stats, heatmap
             return stats
@@ -1628,7 +1711,7 @@ class Backtest:
              smooth_equity=False, relative_equity=True,
              superimpose: Union[bool, str] = True,
              resample=True, reverse_indicators=False,
-             show_legend=True, open_browser=True):
+             show_legend=True, open_browser=True, date_range=[None, None]):
         """
         Plot the progression of the last backtest run.
 
@@ -1731,7 +1814,8 @@ class Backtest:
             resample=resample,
             reverse_indicators=reverse_indicators,
             show_legend=show_legend,
-            open_browser=open_browser)
+            open_browser=open_browser,
+            date_range=date_range,)
 
 
 # NOTE: Don't put anything public below this __all__ list

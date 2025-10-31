@@ -40,6 +40,7 @@ def compute_stats(
         ohlc_data: pd.DataFrame,
         strategy_instance: Strategy | None,
         risk_free_rate: float = 0,
+        n_ambiguous: int = 0,
 ) -> pd.Series:
     assert -1 < risk_free_rate < 1
 
@@ -75,13 +76,17 @@ def compute_stats(
         trades_df['Tag'] = [t.tag for t in trades]
 
         # Add indicator values
+        ind_values = {}
         if len(trades_df) and strategy_instance:
             for ind in strategy_instance._indicators:
                 ind = np.atleast_2d(ind)
                 for i, values in enumerate(ind):  # multi-d indicators
                     suffix = f'_{i}' if len(ind) > 1 else ''
-                    trades_df[f'Entry_{ind.name}{suffix}'] = values[trades_df['EntryBar'].values]
-                    trades_df[f'Exit_{ind.name}{suffix}'] = values[trades_df['ExitBar'].values]
+                    ind_values[f'Entry_{ind.name}{suffix}'] = values[trades_df['EntryBar'].values]
+                    # trades_df[f'Entry_{ind.name}{suffix}'] = values[trades_df['EntryBar'].values]
+                    ind_values[f'Exit_{ind.name}{suffix}'] = values[trades_df['ExitBar'].values]
+                    # trades_df[f'Exit_{ind.name}{suffix}'] = values[trades_df['ExitBar'].values]
+        trades_df = pd.concat((trades_df, pd.DataFrame(ind_values)), axis=1)
 
         commissions = sum(t._commissions for t in trades)
     del trades
@@ -112,7 +117,10 @@ def compute_stats(
         s.loc['Commissions [$]'] = commissions
     s.loc['Return [%]'] = (equity[-1] - equity[0]) / equity[0] * 100
     first_trading_bar = _indicator_warmup_nbars(strategy_instance)
-    c = ohlc_data.Close.values
+    if "Baseline_Close" in ohlc_data.columns:
+        c = ohlc_data.Baseline_Close.values
+    else:
+        c = ohlc_data.Close.values
     s.loc['Buy & Hold Return [%]'] = (c[-1] - c[first_trading_bar]) / c[first_trading_bar] * 100  # long-only return
 
     gmean_day_return: float = 0
@@ -143,6 +151,7 @@ def compute_stats(
     if is_datetime_index:
         time_in_years = (s.loc['Duration'].days + s.loc['Duration'].seconds / 86400) / annual_trading_days
         s.loc['CAGR [%]'] = ((s.loc['Equity Final [$]'] / equity[0])**(1 / time_in_years) - 1) * 100 if time_in_years else np.nan  # noqa: E501
+        s.loc['Buy & Hold CAGR [%]'] = ((c[-1] / c[first_trading_bar])**(1 / time_in_years) - 1) * 100 if time_in_years else np.nan  # noqa: E501
 
     # Our Sharpe mismatches `empyrical.sharpe_ratio()` because they use arithmetic mean return
     # and simple standard deviation
@@ -179,6 +188,7 @@ def compute_stats(
     s.loc['Expectancy [%]'] = returns.mean() * 100
     s.loc['SQN'] = np.sqrt(n_trades) * pl.mean() / (pl.std() or np.nan)
     s.loc['Kelly Criterion'] = win_rate - (1 - win_rate) / (pl[pl > 0].mean() / -pl[pl < 0].mean())
+    s.loc['Order Exec. Ambiguous [%]'] =  np.nan if not n_trades else n_ambiguous/float(n_trades) * 100
 
     s.loc['_strategy'] = strategy_instance
     s.loc['_equity_curve'] = equity_df

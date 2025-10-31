@@ -31,6 +31,9 @@ from bokeh.models import (  # type: ignore
     DatetimeTickFormatter,
     WheelZoomTool,
     LinearColorMapper,
+    Rect,
+    Arrow,
+    NormalHead
 )
 try:
     from bokeh.models import CustomJSTickFormatter
@@ -110,16 +113,16 @@ def lightness(color, lightness=.94):
     return RGB(*rgb)
 
 
-_MAX_CANDLES = 10_000
+_MAX_CANDLES = 50_000
 _INDICATOR_HEIGHT = 50
 
 
-def _maybe_resample_data(resample_rule, df, indicators, equity_data, trades):
+def _maybe_resample_data(resample_rule, df, indicators, equity_data, trades, orders):
     if isinstance(resample_rule, str):
         freq = resample_rule
     else:
         if resample_rule is False or len(df) <= _MAX_CANDLES:
-            return df, indicators, equity_data, trades
+            return df, indicators, equity_data, trades, orders
 
         freq_minutes = pd.Series({
             "1min": 1,
@@ -142,6 +145,7 @@ def _maybe_resample_data(resample_rule, df, indicators, equity_data, trades):
                       "See `Backtest.plot(resample=...)`")
 
     from .lib import OHLCV_AGG, TRADES_AGG, _EQUITY_AGG
+    df_orig = df.copy(deep=True)
     df = df.resample(freq, label='right').agg(OHLCV_AGG).dropna()
 
     def try_mean_first(indicator):
@@ -175,16 +179,34 @@ def _maybe_resample_data(resample_rule, df, indicators, equity_data, trades):
                 return new_bar_idx
         return f
 
-    if len(trades):  # Avoid pandas "resampling on Int64 index" error
-        trades = trades.assign(count=1).resample(freq, on='ExitTime', label='right').agg(dict(
-            TRADES_AGG,
-            ReturnPct=_weighted_returns,
-            count='sum',
-            EntryBar=_group_trades('EntryTime'),
-            ExitBar=_group_trades('ExitTime'),
-        )).dropna()
+    # if len(trades):  # Avoid pandas "resampling on Int64 index" error
+    #     trades = trades.assign(count=1).resample(freq, on='ExitTime', label='right').agg(dict(
+    #         TRADES_AGG,
+    #         ReturnPct=_weighted_returns,
+    #         count='sum',
+    #         EntryBar=_group_trades('EntryTime'),
+    #         ExitBar=_group_trades('ExitTime'),
+    #     )).dropna()
+    if len(trades):
+        cols_to_keep = ['Size', 'EntryPrice', 'ExitPrice', 'SL', 'TP',
+            'PnL', 'ReturnPct', 'Duration', 'Tag']
+        trades_resampled = trades[cols_to_keep].copy(deep=True)
+        trades_resampled['EntryBar'] = df.index.get_indexer(trades['EntryTime'], method='nearest')
+        trades_resampled['EntryTime'] = df.index[trades_resampled['EntryBar']].values
 
-    return df, indicators, equity_data, trades
+        trades_resampled['ExitBar'] = df.index.get_indexer(trades['ExitTime'], method='nearest')
+        trades_resampled['ExitTime'] = df.index[trades_resampled['ExitBar']].values
+    else:
+        trades_resampled = pd.DataFrame()
+    
+    if len(orders):
+        order_time = df_orig.index[orders['time_index']]
+        orders['Bar'] = df.index.get_indexer(order_time, method='nearest')
+        orders['Time'] = df.index[orders['Bar']].values
+    else:
+        orders = pd.DataFrame()
+
+    return df, indicators, equity_data, trades_resampled, orders
 
 
 def plot(*, results: pd.Series,
@@ -196,7 +218,7 @@ def plot(*, results: pd.Series,
          smooth_equity=False, relative_equity=True,
          superimpose=True, resample=True,
          reverse_indicators=True,
-         show_legend=True, open_browser=True):
+         show_legend=True, open_browser=True, date_range=[None, None]):
     """
     Like much of GUI code everywhere, this is a mess.
     """
@@ -213,6 +235,7 @@ def plot(*, results: pd.Series,
     assert df.index.equals(results['_equity_curve'].index)
     equity_data = results['_equity_curve'].copy(deep=False)
     trades = results['_trades']
+    orderhist = results['_orderhist']
 
     plot_volume = plot_volume and not df.Volume.isnull().all()
     plot_equity = plot_equity and not trades.empty
@@ -225,10 +248,28 @@ def plot(*, results: pd.Series,
     # ohlc df may contain many columns. We're only interested in, and pass on to Bokeh, these
     df = df[list(OHLCV_AGG.keys())].copy(deep=False)
 
+    # Apply date range filter
+    if date_range[0] is not None:
+        if not is_datetime_index:
+            raise ValueError("Date range filtering requires a datetime index.")
+        indicators = [i[df.index >= date_range[0]] for i in indicators]
+        equity_data = equity_data[equity_data.index >= date_range[0]]
+        if len(trades):
+            trades = trades[trades['ExitTime'] >= date_range[0]]
+        df = df[df.index >= date_range[0]]
+    if date_range[1] is not None:
+        if not is_datetime_index:
+            raise ValueError("Date range filtering requires a datetime index.")
+        indicators = [i[df.index <= date_range[1]] for i in indicators]
+        equity_data = equity_data[equity_data.index <= date_range[1]]
+        if len(trades):
+            trades = trades[trades['ExitTime'] <= date_range[1]]
+        df = df[df.index <= date_range[1]]
+
     # Limit data to max_candles
     if is_datetime_index:
-        df, indicators, equity_data, trades = _maybe_resample_data(
-            resample, df, indicators, equity_data, trades)
+        df, indicators, equity_data, trades, orderhist = _maybe_resample_data(
+            resample, df, indicators, equity_data, trades, orderhist)
 
     df.index.name = None  # Provides source name @index
     df['datetime'] = df.index  # Save original, maybe datetime index
@@ -242,7 +283,7 @@ def plot(*, results: pd.Series,
         width=plot_width,
         height=400,
         # TODO: xwheel_pan on horizontal after https://github.com/bokeh/bokeh/issues/14363
-        tools="xpan,xwheel_zoom,xwheel_pan,box_zoom,undo,redo,reset,save",
+        tools="ywheel_zoom,ywheel_pan,xpan,xwheel_zoom,xwheel_pan,box_zoom,undo,redo,reset,save",
         active_drag='xpan',
         active_scroll='xwheel_zoom')
 
@@ -258,12 +299,13 @@ def plot(*, results: pd.Series,
     source = ColumnDataSource(df)
     source.add((df.Close >= df.Open).values.astype(np.uint8).astype(str), 'inc')
 
-    trade_source = ColumnDataSource(dict(
-        index=trades['ExitBar'],
-        datetime=trades['ExitTime'],
-        size=trades['Size'],
-        returns_positive=(trades['ReturnPct'] > 0).astype(int).astype(str),
-    ))
+    if plot_trades:
+        trade_source = ColumnDataSource(dict(
+            index=trades['ExitBar'],
+            datetime=trades['ExitTime'],
+            size=trades['Size'],
+            returns_positive=(trades['ReturnPct'] > 0).astype(int).astype(str),
+        ))
 
     inc_cmap = factor_cmap('inc', COLORS, ['0', '1'])
     cmap = factor_cmap('returns_positive', COLORS, ['0', '1'])
@@ -515,6 +557,49 @@ return this.labels[index] || "";
 
     def _plot_ohlc_trades():
         """Trade entry / exit markers on OHLC plot"""
+        # For plotting limit orders
+        # Organize trade data into glyph source format
+        xs = list()
+        ystp = list()
+        ws = list()
+        hstp = list()
+        yssl = list()
+        hssl = list()
+        oh = orderhist
+        for i, trade in trades.iterrows():
+            # Corresponding entry order
+            try:
+                entry_order = oh[oh['tag'] == trade['Tag']].iloc[0]
+            except:
+                continue
+            xs.append((entry_order['Bar'] + trade['ExitBar'])*0.5)
+            ws.append(trade['ExitBar'] - entry_order['Bar'])
+            ystp.append((entry_order['limit'] + entry_order['tp'])*0.5)
+            hstp.append(entry_order['tp'] - entry_order['limit'])
+            yssl.append((entry_order['limit'] + entry_order['sl'])*0.5)
+            hssl.append(entry_order['limit'] - entry_order['sl'])
+        if len(xs) > 0:
+            glyph = Rect(x="x", y="y", width="w", height="h", fill_color=BULL_COLOR, fill_alpha=0.5, line_color=None)
+            source = ColumnDataSource(dict(x=xs, y=ystp, w=ws, h=hstp))
+            fig_ohlc.add_glyph(source, glyph)  # https://docs.bokeh.org/en/2.4.3/docs/reference/models/glyphs/rect.html
+            glyph = Rect(x="x", y="y", width="w", height="h", fill_color=BEAR_COLOR, fill_alpha=0.5, line_color=None)
+            source = ColumnDataSource(dict(x=xs, y=yssl, w=ws, h=hssl))
+            fig_ohlc.add_glyph(source, glyph) 
+
+        # Plot markers for entry and exits
+        for i, trade in trades.iterrows():
+            # Plot up arrow for long entries
+            arrow_width = 2
+            if trade['Size'] > 0:
+                head = NormalHead(fill_color=BULL_COLOR, line_width=arrow_width * 2)
+                fig_ohlc.add_layout(Arrow(end=head, line_color=BULL_COLOR, line_width=arrow_width,
+                    x_start=trade['EntryBar'], y_start=trade['EntryPrice'], x_end=trade['EntryBar'], y_end=max(trade['EntryPrice']*1.02, trade['ExitPrice'])),)
+            elif trade['Size'] < 0:
+                head = NormalHead(fill_color=BEAR_COLOR, line_width=arrow_width * 2)
+                fig_ohlc.add_layout(Arrow(end=head, line_color=BEAR_COLOR, line_width=arrow_width,
+                    x_start=trade['EntryBar'], y_start=trade['EntryPrice'], x_end=trade['EntryBar'], y_end=min(trade['EntryPrice']*0.98, trade['ExitPrice'])),)
+
+        # For plotting trade trajectories
         trade_source.add(trades[['EntryBar', 'ExitBar']].values.tolist(), 'position_lines_xs')
         trade_source.add(trades[['EntryPrice', 'ExitPrice']].values.tolist(), 'position_lines_ys')
         fig_ohlc.multi_line(xs='position_lines_xs', ys='position_lines_ys',
@@ -580,12 +665,12 @@ return this.labels[index] || "";
                 source.add(arr, source_name)
                 tooltips.append(f'@{{{source_name}}}{{0,0.0[0000]}}')
                 if is_overlay:
-                    ohlc_extreme_values[source_name] = arr
+                    # ohlc_extreme_values[source_name] = arr
                     if is_scatter:
                         fig.circle(
                             'index', source_name, source=source,
                             legend_label=legend_labels[j], color=color,
-                            line_color='black', fill_alpha=.8,
+                            line_color=color, fill_alpha=.8,
                             radius=BAR_WIDTH / 2 * .9)
                     else:
                         fig.line(
@@ -632,7 +717,7 @@ return this.labels[index] || "";
     if plot_drawdown:
         figs_above_ohlc.append(_plot_drawdown_section())
 
-    if plot_pl:
+    if plot_pl and plot_trades:
         figs_above_ohlc.append(_plot_pl_section())
 
     if plot_volume:
@@ -662,8 +747,8 @@ return this.labels[index] || "";
     if plot_volume:
         custom_js_args.update(volume_range=fig_volume.y_range)
 
-    fig_ohlc.x_range.js_on_change('end', CustomJS(args=custom_js_args,
-                                                  code=_AUTOSCALE_JS_CALLBACK))
+    # fig_ohlc.x_range.js_on_change('end', CustomJS(args=custom_js_args,
+    #                                               code=_AUTOSCALE_JS_CALLBACK))
 
     figs = figs_above_ohlc + [fig_ohlc] + figs_below_ohlc
     linked_crosshair = CrosshairTool(

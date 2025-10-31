@@ -187,6 +187,7 @@ class _Data:
                          for col, arr in self.__df.items()}
         # Leave index as Series because pd.Timestamp nicer API to work with
         self.__arrays['__index'] = index
+        self.__len = len(self.__df)
 
     def __repr__(self):
         i = min(self.__len, len(self.__df)) - 1
